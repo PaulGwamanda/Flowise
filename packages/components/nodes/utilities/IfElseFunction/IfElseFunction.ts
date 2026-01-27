@@ -1,7 +1,6 @@
-import { ICommonObject, IDatabaseEntity, INode, INodeData, INodeOutputsValue, INodeParams } from '../../../src/Interface'
-import { NodeVM } from 'vm2'
 import { DataSource } from 'typeorm'
-import { availableDependencies, defaultAllowBuiltInDep, getVars, handleEscapeCharacters, prepareSandboxVars } from '../../../src/utils'
+import { getVars, handleEscapeCharacters, executeJavaScriptCode, createCodeExecutionSandbox } from '../../../src/utils'
+import { ICommonObject, IDatabaseEntity, INode, INodeData, INodeOutputsValue, INodeParams } from '../../../src/Interface'
 
 class IfElseFunction_Utilities implements INode {
     label: string
@@ -11,6 +10,7 @@ class IfElseFunction_Utilities implements INode {
     type: string
     icon: string
     category: string
+    tags: string[]
     baseClasses: string[]
     inputs: INodeParams[]
     outputs: INodeOutputsValue[]
@@ -18,12 +18,13 @@ class IfElseFunction_Utilities implements INode {
     constructor() {
         this.label = 'IfElse Function'
         this.name = 'ifElseFunction'
-        this.version = 1.0
+        this.version = 2.0
         this.type = 'IfElseFunction'
         this.icon = 'ifelsefunction.svg'
         this.category = 'Utilities'
         this.description = `Split flows based on If Else javascript functions`
         this.baseClasses = [this.type, 'Utilities']
+        this.tags = ['Utilities']
         this.inputs = [
             {
                 label: 'Input Variables',
@@ -64,12 +65,14 @@ class IfElseFunction_Utilities implements INode {
             {
                 label: 'True',
                 name: 'returnTrue',
-                baseClasses: ['string', 'number', 'boolean', 'json', 'array']
+                baseClasses: ['string', 'number', 'boolean', 'json', 'array'],
+                isAnchor: true
             },
             {
                 label: 'False',
                 name: 'returnFalse',
-                baseClasses: ['string', 'number', 'boolean', 'json', 'array']
+                baseClasses: ['string', 'number', 'boolean', 'json', 'array'],
+                isAnchor: true
             }
         ]
     }
@@ -81,7 +84,7 @@ class IfElseFunction_Utilities implements INode {
         const appDataSource = options.appDataSource as DataSource
         const databaseEntities = options.databaseEntities as IDatabaseEntity
 
-        const variables = await getVars(appDataSource, databaseEntities, nodeData)
+        const variables = await getVars(appDataSource, databaseEntities, nodeData, options)
         const flow = {
             chatflowId: options.chatflowid,
             sessionId: options.sessionId,
@@ -101,51 +104,41 @@ class IfElseFunction_Utilities implements INode {
 
         // Some values might be a stringified JSON, parse it
         for (const key in inputVars) {
-            if (typeof inputVars[key] === 'string' && inputVars[key].startsWith('{') && inputVars[key].endsWith('}')) {
-                try {
-                    inputVars[key] = JSON.parse(inputVars[key])
-                } catch (e) {
-                    continue
+            let value = inputVars[key]
+            if (typeof value === 'string') {
+                value = handleEscapeCharacters(value, true)
+                if (value.startsWith('{') && value.endsWith('}')) {
+                    try {
+                        value = JSON.parse(value)
+                    } catch (e) {
+                        // ignore
+                    }
                 }
+                inputVars[key] = value
             }
         }
 
-        let sandbox: any = { $input: input }
-        sandbox['$vars'] = prepareSandboxVars(variables)
-        sandbox['$flow'] = flow
+        // Create additional sandbox variables
+        const additionalSandbox: ICommonObject = {}
 
+        // Add input variables to sandbox
         if (Object.keys(inputVars).length) {
             for (const item in inputVars) {
-                let value = inputVars[item]
-                if (typeof value === 'string') {
-                    value = handleEscapeCharacters(value, true)
-                }
-                sandbox[`$${item}`] = value
+                additionalSandbox[`$${item}`] = inputVars[item]
             }
         }
 
-        const builtinDeps = process.env.TOOL_FUNCTION_BUILTIN_DEP
-            ? defaultAllowBuiltInDep.concat(process.env.TOOL_FUNCTION_BUILTIN_DEP.split(','))
-            : defaultAllowBuiltInDep
-        const externalDeps = process.env.TOOL_FUNCTION_EXTERNAL_DEP ? process.env.TOOL_FUNCTION_EXTERNAL_DEP.split(',') : []
-        const deps = availableDependencies.concat(externalDeps)
+        const sandbox = createCodeExecutionSandbox(input, variables, flow, additionalSandbox)
 
-        const nodeVMOptions = {
-            console: 'inherit',
-            sandbox,
-            require: {
-                external: { modules: deps },
-                builtin: builtinDeps
-            }
-        } as any
-
-        const vm = new NodeVM(nodeVMOptions)
         try {
-            const responseTrue = await vm.run(`module.exports = async function() {${ifFunction}}()`, __dirname)
-            if (responseTrue) return { output: responseTrue, type: true }
+            const responseTrue = await executeJavaScriptCode(ifFunction, sandbox)
 
-            const responseFalse = await vm.run(`module.exports = async function() {${elseFunction}}()`, __dirname)
-            return { output: responseFalse, type: false }
+            if (responseTrue)
+                return { output: typeof responseTrue === 'string' ? handleEscapeCharacters(responseTrue, false) : responseTrue, type: true }
+
+            const responseFalse = await executeJavaScriptCode(elseFunction, sandbox)
+
+            return { output: typeof responseFalse === 'string' ? handleEscapeCharacters(responseFalse, false) : responseFalse, type: false }
         } catch (e) {
             throw new Error(e)
         }
